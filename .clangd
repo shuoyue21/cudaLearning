@@ -1,0 +1,58 @@
+# .clangd configuration file
+
+# Apply this config conditionally to all C files
+---
+If:
+  PathMatch: .*\.(c|h)$
+CompileFlags:
+  Compiler: /usr/bin/gcc
+
+
+# Apply this config conditionally to all C++ files
+---
+If:
+  PathMatch: .*\.(c|h)pp
+CompileFlags:
+  Compiler: /usr/bin/g++
+
+
+# Apply this config conditionally to all CUDA files
+---
+If:
+  PathMatch: .*\.cuh?
+CompileFlags:
+  Compiler: /usr/local/cuda/bin/nvcc
+  Add:
+    - "--cuda-path=/usr/local/cuda-13.1"
+    - "--cuda-gpu-arch=sm_120"
+
+
+# Tweak the clangd parse settings for all files
+---
+CompileFlags:
+  CompilationDatabase: build
+  Add:
+    # report all errors
+    - "-ferror-limit=0"
+  Remove:
+    - "-G"
+    # strip CUDA fatbin args
+    - "-Xfatbin*"
+    # strip CUDA arch flags
+    - "-gencode*"
+    - "--generate-code*"
+    # strip CUDA flags unknown to clang
+    - "-ccbin*"
+    - "--compiler-options*"
+    - "--expt-extended-lambda"
+    - "--expt-relaxed-constexpr"
+    - "-forward-unknown-to-host-compiler"
+    - "-Werror=cross-execution-space-call"
+Hover:
+  ShowAKA: true
+InlayHints:
+  Enabled: true
+Diagnostics:
+  Suppress:
+    - "variadic_device_fn"
+    - "attributes_not_allowed"

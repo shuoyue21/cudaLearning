@@ -22,9 +22,9 @@ If:
   PathMatch: .*\.cuh?
 CompileFlags:
   Compiler: /usr/local/cuda/bin/nvcc
-  Add:
-    - "--cuda-path=/usr/local/cuda-13.1"
-    - "--cuda-gpu-arch=sm_120"
+  # Add:
+  #   - "--cuda-path=/usr/local/cuda-13.1"
+  #   - "--cuda-gpu-arch=sm_120"
 
 
 # Tweak the clangd parse settings for all files

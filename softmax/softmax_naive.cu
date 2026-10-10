@@ -118,3 +118,72 @@ __global__ void softmax_forward_kernel2(float* out, const float* inp, int N,
     out[idx * C + i] = out[idx * C + i] / sum;
   }
 }
+template <unsigned int NUM_PER_THREAD, unsigned int SHARED_MEM>
+__global__ void softmax_forward_kernel3(float* out, const float* inp, int N,
+                                        int C) {
+  // 一个Block处理一行,然后先求最大值,然后在exp求和再计算
+  int tid = threadIdx.x;
+  const float* start = inp + blockIdx.x * C;
+  float* out_start = out + blockIdx.x * C;
+  float maxval = -INFINITY;
+  for (int i = tid; i < C; i += blockDim.x) {
+    maxval = std::fmax(maxval, start[i]);
+  }
+  constexpr unsigned int MASK = 0xFFFFFFFFu;
+#pragma unroll
+  for (int offset = 16; offset > 0; offset >>= 1) {
+    maxval = std::fmax(maxval, __shfl_xor_sync(MASK, maxval, offset));
+  }
+  __shared__ float shared[SHARED_MEM];
+  int warpID = tid / 32;
+  int laneID = tid % 32;
+  if (laneID == 0) shared[warpID] = maxval;
+  __syncthreads();
+
+  // 在第一个warp内进行
+  int numWarps = blockDim.x / 32;
+  if (warpID == 0) {
+    float lineMax = (laneID < numWarps) ? shared[laneID] : -INFINITY;
+#pragma unroll
+    for (int offset = 16; offset > 0; offset >>= 1) {
+      lineMax = std::fmax(lineMax, __shfl_xor_sync(MASK, lineMax, offset));
+    }
+    if (laneID == 0) shared[0] = lineMax;
+  }
+  __syncthreads();
+
+  maxval = shared[0];
+  // 得到max之后,开始reduction
+  float sum = 0.f;
+  for (int i = tid; i < C; i += blockDim.x) {
+    float temp = std::exp(start[i] - maxval);
+    sum += temp;
+    out_start[i] = temp;
+  }
+  __syncthreads();
+#pragma unroll
+  for (int offset = 16; offset > 0; offset >>= 1) {
+    sum += __shfl_xor_sync(MASK, sum, offset);
+  }
+  if (laneID == 0) shared[warpID] = sum;
+  __syncthreads();
+
+  if (warpID == 0) {
+    float lineSum = (laneID < numWarps) ? shared[laneID] : 0;
+#pragma unroll
+    for (int offset = 16; offset > 0; offset >>= 1) {
+      lineSum += __shfl_xor_sync(MASK, lineSum, offset);
+    }
+    if (laneID == 0) shared[0] = lineSum;
+  }
+  __syncthreads();
+  sum = shared[0];
+  float norm = 1 / sum;
+  for (int i = tid; i < C; i += blockDim.x) {
+    out_start[i] *= norm;
+  }
+}
+
+template __global__ void softmax_forward_kernel3<32, 32>(float* out,
+                                                         const float* inp,
+                                                         int N, int C);

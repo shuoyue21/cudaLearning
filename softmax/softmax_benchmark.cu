@@ -23,6 +23,9 @@
 extern void softmax_forward_cpu(float* out, const float* inp, int N, int C);
 __global__ void softmax_forward_kernel2(float* out, const float* inp, int N,
                                         int C);
+template <unsigned int NUM_PER_THREAD, unsigned int SHARED_MEM>
+__global__ void softmax_forward_kernel3(float* out, const float* inp, int N,
+                                        int C);
 
 // -----------------------------------------------------------------------------
 // 误差检验辅助函数
@@ -57,20 +60,29 @@ float benchmark_kernel(int kernel_id, float* d_out, const float* d_inp,
   int numBlocks = 0;
   size_t shared_mem_size = 0;
 
-  if (kernel_id == 1) {
-    blockSize = 128;
-    numBlocks = (N + blockSize - 1) / blockSize;
-    shared_mem_size = 0;
-  } else if (kernel_id == 2) {
+  if (kernel_id == 2) {
     blockSize = 128;
     numBlocks = N;
     shared_mem_size = blockSize * sizeof(float);
+  } else if (kernel_id == 3) {
+    blockSize = 128;
+    numBlocks = N;
+    shared_mem_size = 0;
   }
+
+  auto launch_kernel = [&]() {
+    if (kernel_id == 2) {
+      softmax_forward_kernel2<<<numBlocks, blockSize, shared_mem_size>>>(
+          d_out, d_inp, N, C);
+    } else if (kernel_id == 3) {
+      softmax_forward_kernel3<32, 32><<<numBlocks, blockSize>>>(
+          d_out, d_inp, N, C);
+    }
+  };
 
   // 1. 预热 (Warm-up)
   for (int w = 0; w < warmup; ++w) {
-    softmax_forward_kernel2<<<numBlocks, blockSize, shared_mem_size>>>(
-        d_out, d_inp, N, C);
+    launch_kernel();
   }
   CUDA_CHECK(cudaGetLastError());
   CUDA_CHECK(cudaDeviceSynchronize());
@@ -82,8 +94,7 @@ float benchmark_kernel(int kernel_id, float* d_out, const float* d_inp,
 
   CUDA_CHECK(cudaEventRecord(start));
   for (int r = 0; r < repeat; ++r) {
-    softmax_forward_kernel2<<<numBlocks, blockSize, shared_mem_size>>>(
-        d_out, d_inp, N, C);
+    launch_kernel();
   }
   CUDA_CHECK(cudaEventRecord(stop));
   CUDA_CHECK(cudaEventSynchronize(stop));
@@ -178,15 +189,8 @@ int main(int argc, char** argv) {
   CUDA_CHECK(cudaMemcpy(d_inp, h_inp, bytes, cudaMemcpyHostToDevice));
 
   // 5. 执行选定的核函数评测
-  float t_gpu1 = 0.0f;
   float t_gpu2 = 0.0f;
-
-  if (choice == "1" || choice == "all") {
-    std::printf("--- Kernel 1 (Naive: 1 Thread / Row) ---\n");
-    t_gpu1 = benchmark_kernel(1, d_out, d_inp, h_out_gpu, h_out_cpu, N, C,
-                              cpu_time_ms, repeat, warmup);
-    std::printf("\n");
-  }
+  float t_gpu3 = 0.0f;
 
   if (choice == "2" || choice == "all") {
     std::printf("--- Kernel 2 (Block Coarsening & Shared Memory) ---\n");
@@ -195,12 +199,19 @@ int main(int argc, char** argv) {
     std::printf("\n");
   }
 
-  // 6. 如果同时跑了两个核函数，输出对比总结
+  if (choice == "3" || choice == "all") {
+    std::printf("--- Kernel 3 (Warp Shuffle + Inter-Warp Shared Memory) ---\n");
+    t_gpu3 = benchmark_kernel(3, d_out, d_inp, h_out_gpu, h_out_cpu, N, C,
+                              cpu_time_ms, repeat, warmup);
+    std::printf("\n");
+  }
+
+  // 6. 如果同时跑了核函数，输出对比总结
   if (choice == "all") {
     std::printf("================ Performance Summary ================\n");
-    std::printf("Kernel 1 GPU Time : %.6f ms\n", t_gpu1);
     std::printf("Kernel 2 GPU Time : %.6f ms\n", t_gpu2);
-    std::printf("Kernel 2 vs Kernel 1 Speedup : %.2fx\n", t_gpu1 / t_gpu2);
+    std::printf("Kernel 3 GPU Time : %.6f ms\n", t_gpu3);
+    std::printf("Kernel 3 vs Kernel 2 Speedup : %.2fx\n", t_gpu2 / t_gpu3);
     std::printf("====================================================\n");
   }
 

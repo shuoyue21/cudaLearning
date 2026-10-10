@@ -66,9 +66,24 @@ add_executable(sgemm_benchmark
   sgemm_v4.cu
   sgemm_v5.cu
   sgemm_v6.cu
+  sgemm_warp_tiling_benchmark.cu
 )
 target_compile_definitions(sgemm_benchmark PRIVATE SGEMM_BENCHMARK)
 target_link_libraries(sgemm_benchmark PRIVATE CUDA::cudart CUDA::cublas)
+
+option(SGEMM_ENABLE_CUTLASS "Include CUTLASS FP32 SIMT comparison kernels" OFF)
+set(CUTLASS_ROOT "" CACHE PATH "Path to a CUTLASS source checkout")
+if(SGEMM_ENABLE_CUTLASS)
+  find_path(CUTLASS_INCLUDE_DIR cutlass/cutlass.h
+    HINTS "${CUTLASS_ROOT}/include" "${CUTLASS_ROOT}")
+  if(NOT CUTLASS_INCLUDE_DIR)
+    message(FATAL_ERROR "CUTLASS headers not found; set CUTLASS_ROOT")
+  endif()
+  target_sources(sgemm_benchmark PRIVATE sgemm_cutlass_benchmark.cu)
+  target_include_directories(sgemm_benchmark SYSTEM PRIVATE "${CUTLASS_INCLUDE_DIR}")
+  target_compile_definitions(sgemm_benchmark PRIVATE SGEMM_WITH_CUTLASS)
+  message(STATUS "CUTLASS headers: ${CUTLASS_INCLUDE_DIR}")
+endif()
 
 if(CMAKE_BUILD_TYPE STREQUAL "Debug")
   message(WARNING "sgemm_benchmark should be built in Release mode for timing")

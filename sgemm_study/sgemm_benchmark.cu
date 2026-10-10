@@ -80,6 +80,18 @@ const std::vector<Shape> kDefaultShapes = {
     {512, 512, 2048},   {127, 193, 65},
 };
 
+// 扩展比较：保留原来的 14 组，再覆盖大方阵、短/长 K、细长和尾部尺寸。
+const std::vector<Shape> kExtendedShapes = {
+    {1, 1, 1},          {32, 32, 32},       {64, 64, 64},
+    {96, 96, 96},       {128, 128, 128},    {256, 256, 256},
+    {512, 512, 512},    {1000, 1000, 1000}, {1024, 1024, 1024},
+    {2048, 2048, 2048}, {4096, 4096, 4096}, {512, 256, 256},
+    {1024, 256, 1024},  {256, 1024, 1024},  {1024, 1024, 256},
+    {512, 512, 2048},   {256, 256, 4096},   {2048, 2048, 32},
+    {2048, 128, 1024},  {128, 2048, 1024},  {4096, 256, 256},
+    {256, 4096, 256},   {127, 193, 65},     {513, 257, 129},
+};
+
 struct Options {
   int device = 0;
   int warmup = 20;
@@ -87,6 +99,8 @@ struct Options {
   int samples = 7;
   bool list = false;
   std::string csv_path;
+  std::string suite = "default";
+  std::vector<std::string> kernels;
   std::vector<Shape> shapes;
 };
 
@@ -97,9 +111,10 @@ struct Kernel {
   const char* description;
   int alignment;
   Launch launch;
+  Launch prepare = nullptr;
 };
 
-const std::array<Kernel, 6> kKernels = {{
+const std::vector<Kernel> kKernels = {
     {"v1", "16x16 tile, 1 output/thread", 1, sgemm_v1::launch},
     {"v2", "16x16 tile, currently same computation as v1", 1,
      sgemm_v2::launch},
@@ -110,7 +125,25 @@ const std::array<Kernel, 6> kKernels = {{
      sgemm_v5::launch},
     {"v6", "32x32 tile, async copies, two stages, 4x4 outputs/thread", 32,
      sgemm_v6::launch},
-}};
+    {"warp32", "32x32 block, 16x32 warp, 4x4 thread, BK=32, boundary checks",
+     1, sgemm_warp_tiling::launch32},
+    {"warp64", "64x64 block, 16x32 warp, 4x4 thread, BK=16, boundary checks",
+     1, sgemm_warp_tiling::launch64},
+#ifdef SGEMM_WITH_CUTLASS
+    {"cutlass32", "CUTLASS FP32 SIMT, 32x32x8 block, 16x32x8 warp, stages=2",
+     1, sgemm_cutlass::launch32, sgemm_cutlass::prepare32},
+    {"cutlass64", "CUTLASS FP32 SIMT, 64x64x8 block, 16x32x8 warp, stages=2",
+     1, sgemm_cutlass::launch64, sgemm_cutlass::prepare64},
+    {"cutlass128", "CUTLASS FP32 SIMT, 128x128x8 block, 32x64x8 warp, stages=2",
+     1, sgemm_cutlass::launch128, sgemm_cutlass::prepare128},
+#endif
+};
+
+bool selected(const Options& options, const Kernel& kernel) {
+  return options.kernels.empty() ||
+         std::find(options.kernels.begin(), options.kernels.end(), kernel.name) !=
+             options.kernels.end();
+}
 
 bool supports(const Kernel& kernel, const Shape& shape) {
   return shape.m % kernel.alignment == 0 &&
@@ -141,6 +174,8 @@ void validate_shape(const Shape& shape) {
 void print_usage(const char* program) {
   std::printf(
       "Usage: %s [options]\n"
+      "  --suite NAME   default (14 shapes) or extended (24 shapes)\n"
+      "  --kernels LIST Comma-separated names; default: all compiled kernels\n"
       "  --shape M N K  Test this shape; repeat to test multiple shapes\n"
       "                 A[M,K] * B[K,N] = C[M,N]\n"
       "  --warmup N     Warmup launches per version (default: 20)\n"
@@ -164,7 +199,27 @@ Options parse_options(int argc, char** argv) {
       }
       return argv[i];
     };
-    if (argument == "--shape") {
+    if (argument == "--suite") {
+      options.suite = next();
+      if (options.suite != "default" && options.suite != "extended") {
+        throw std::runtime_error("Unknown suite: " + options.suite);
+      }
+    } else if (argument == "--kernels") {
+      const std::string names = next();
+      size_t begin = 0;
+      while (true) {
+        const size_t end = names.find(',', begin);
+        const std::string name = names.substr(begin, end - begin);
+        if (name.empty()) throw std::runtime_error("Empty kernel name");
+        if (std::find(options.kernels.begin(), options.kernels.end(), name) !=
+            options.kernels.end()) {
+          throw std::runtime_error("Duplicate kernel: " + name);
+        }
+        options.kernels.push_back(name);
+        if (end == std::string::npos) break;
+        begin = end + 1;
+      }
+    } else if (argument == "--shape") {
       const int m = parse_int(next());
       const int n = parse_int(next());
       const int k = parse_int(next());
@@ -188,20 +243,34 @@ Options parse_options(int argc, char** argv) {
       throw std::runtime_error("Unknown option: " + argument);
     }
   }
-  if (options.shapes.empty()) options.shapes = kDefaultShapes;
+  if (options.shapes.empty()) {
+    options.shapes = options.suite == "extended" ? kExtendedShapes : kDefaultShapes;
+  }
+  for (const std::string& name : options.kernels) {
+    const auto found = std::find_if(kKernels.begin(), kKernels.end(),
+                                   [&](const Kernel& kernel) {
+                                     return name == kernel.name;
+                                   });
+    if (found == kKernels.end()) {
+      throw std::runtime_error("Unknown/uncompiled kernel: " + name);
+    }
+  }
   for (const Shape& shape : options.shapes) validate_shape(shape);
   return options;
 }
 
 void print_shapes(const Options& options) {
   for (const Kernel& kernel : kKernels) {
+    if (!selected(options, kernel)) continue;
     std::printf("%s: %s\n", kernel.name, kernel.description);
   }
   std::printf("\n%7s %7s %7s  Supported versions\n", "M", "N", "K");
   for (const Shape& shape : options.shapes) {
     std::printf("%7d %7d %7d ", shape.m, shape.n, shape.k);
     for (const Kernel& kernel : kKernels) {
-      if (supports(kernel, shape)) std::printf(" %s", kernel.name);
+      if (selected(options, kernel) && supports(kernel, shape)) {
+        std::printf(" %s", kernel.name);
+      }
     }
     std::printf("\n");
   }
@@ -331,16 +400,22 @@ bool benchmark_shape(const Shape& shape, const Options& options,
   check_cuda(cudaStreamSynchronize(stream), "reference synchronize");
   check_reference_on_cpu(shape, a, b, reference);
 
-  std::printf("%-8s %-7s %12s %12s %12s %14s\n", "Version", "Status",
+  std::printf("%-12s %-7s %12s %12s %12s %14s\n", "Version", "Status",
               "Time(ms)", "GFLOPS", "Speedup/v1", "Max abs error");
   const double flops = 2.0 * shape.m * shape.n * shape.k;
   bool correct = true;
   float baseline_ms = 0.0f;
   for (size_t index = 0; index < kKernels.size(); ++index) {
     const Kernel& kernel = kKernels[index];
+    if (!selected(options, kernel)) continue;
     Result result;
     if (supports(kernel, shape)) {
       try {
+        // 库的参数初始化在校验和计时之前完成，计时中只执行已准备的 GEMM。
+        if (kernel.prepare) {
+          kernel.prepare(device_a.data, device_b.data, device_c.data, shape.m,
+                         shape.n, shape.k, stream);
+        }
         // 0xff 对 float 是 NaN：未写回的 C 元素不能靠旧结果蒙混过关。
         check_cuda(cudaMemsetAsync(device_c.data, 0xff, c_bytes, stream),
                    "poison output");
@@ -375,18 +450,18 @@ bool benchmark_shape(const Shape& shape, const Options& options,
       if (baseline_ms > 0) {
         std::snprintf(speedup_text, sizeof(speedup_text), "%.2fx", speedup);
       }
-      std::printf("%-8s %-7s %12.6f %12.2f %12s %14.3e\n", kernel.name,
+      std::printf("%-12s %-7s %12.6f %12.2f %12s %14.3e\n", kernel.name,
                   result.status, result.ms, gflops, speedup_text,
                   result.validation.max_abs_error);
     } else if (result.validation.mismatches > 0) {
       const size_t first = result.validation.first_mismatch;
-      std::printf("%-8s %-7s %12s %12s %12s %14.3e\n", kernel.name,
+      std::printf("%-12s %-7s %12s %12s %12s %14.3e\n", kernel.name,
                   result.status, "-", "-", "-", result.validation.max_abs_error);
       std::printf("  %zu mismatches; first C[%zu,%zu]: ref=%.8g got=%.8g\n",
                   result.validation.mismatches, first / shape.n, first % shape.n,
                   reference[first], output[first]);
     } else {
-      std::printf("%-8s %-7s M, N, K must all be multiples of %d\n",
+      std::printf("%-12s %-7s M, N, K must all be multiples of %d\n",
                   kernel.name, result.status, kernel.alignment);
     }
     std::fflush(stdout);
@@ -444,13 +519,18 @@ int main(int argc, char** argv) {
                 options.warmup, options.repeat, options.samples);
     std::printf("Reference: cuBLAS pedantic FP32 + CPU double spot checks; "
                 "atol=%.0e rtol=%.0e; seed=2026\n", kAtol, kRtol);
-    std::printf("Timing excludes allocation, transfers and validation.\n");
+    std::printf("Timing excludes initialization, allocation, transfers and validation.\n");
+#ifdef SGEMM_WITH_CUTLASS
+    std::printf("CUTLASS %s: FP32 SIMT CUDA-core FMA, alpha=1 beta=0; "
+                "Tensor Cores/TF32 disabled by operator selection.\n",
+                sgemm_cutlass::version());
+#endif
 #ifdef __CUDACC_DEBUG__
     std::fprintf(stderr, "WARNING: CUDA device debugging is enabled; rebuild "
                          "with CMAKE_BUILD_TYPE=Release for performance.\n");
 #endif
     if (properties.major < 8) {
-      std::printf("Note: v6 async global-to-shared copies use a fallback on "
+      std::printf("Note: v6/warp32/warp64 async copies use a fallback on "
                   "GPUs older than sm_80.\n");
     }
 

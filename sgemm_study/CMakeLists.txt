@@ -35,3 +35,18 @@ add_executable(sgemm_v3  sgemm_v3.cu)
 
 # 链接 CUDA 运行时
 target_link_libraries(sgemm_v3  PRIVATE CUDA::cudart)
+
+add_executable(sgemm_v4  sgemm_v4.cu)
+
+# 链接 CUDA 运行时
+target_link_libraries(sgemm_v4  PRIVATE CUDA::cudart)
+
+add_executable(sgemm_v5  sgemm_v5.cu)
+
+# 链接 CUDA 运行时
+target_link_libraries(sgemm_v5  PRIVATE CUDA::cudart)
+
+add_executable(sgemm_double_buffer  sgemm_double_buffer.cu)
+
+# 链接 CUDA 运行时
+target_link_libraries(sgemm_double_buffer  PRIVATE CUDA::cudart)

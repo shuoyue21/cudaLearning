@@ -1,4 +1,4 @@
-#include <__clang_cuda_builtin_vars.h>
+
 #include <cuda_runtime.h>
 
 #include <cmath>
@@ -8,7 +8,8 @@
 #include <cstdlib>
 #include <cstring>
 #include <random>
-void random_matrix(int m, int n, float *matrix) {
+#define FETCH_FLOAT4(x) (*reinterpret_cast<float4*>(&(x)))
+void random_matrix(int m, int n, float* matrix) {
   // 1. 实例化硬件随机设备，用于生成非确定性种子
   std::random_device rd;
 
@@ -26,7 +27,7 @@ void random_matrix(int m, int n, float *matrix) {
   }
 }
 
-void cpu_sgemm(int m, int n, int k, const float *A, const float *B, float *C) {
+void cpu_sgemm(int m, int n, int k, const float* A, const float* B, float* C) {
   // 1. 使用三重循环实现矩阵乘法，外层循环遍历结果矩阵 C 的行和列
   for (int i = 0; i < m; ++i) {
     for (int j = 0; j < n; ++j) {
@@ -40,8 +41,8 @@ void cpu_sgemm(int m, int n, int k, const float *A, const float *B, float *C) {
   }
 }
 
-float calc_max_diff(int m, int n, const float *cpu_result,
-                    const float *gpu_result) {
+float calc_max_diff(int m, int n, const float* cpu_result,
+                    const float* gpu_result) {
   float max_diff = 0.0f;
   const int total = m * n;
   for (int i = 0; i < total; ++i) {
@@ -52,67 +53,59 @@ float calc_max_diff(int m, int n, const float *cpu_result,
 }
 
 // 每个线程处理4个数字,使用float4优化
-template <unsigned int Bm, unsigned int Bn, unsigned int Bk>
-__global__ void cuda_sgemm(float *A, float *B, float *C, const int M,
+template <unsigned int Bm, unsigned int Bn, unsigned int Bk,
+          unsigned int NUM_PER_THREAD>
+__global__ void cuda_sgemm(float* A, float* B, float* C, const int M,
                            const int N, const int K) {
   // 一个thread处理连续的4个元素 (横向)
-  float *A_start = A + blockIdx.y * Bm * K;
-  float *B_start = B + blockIdx.x *;
+  float* A_start = A + blockIdx.y * Bm * K;
+  float* B_start = B + blockIdx.x * Bn;
 
   int tx = threadIdx.x;
   int ty = threadIdx.y;
   int row = blockDim.y * blockIdx.y + threadIdx.y;
   int col = blockDim.x * blockIdx.x + threadIdx.x;
 
-  __shared__ float As[SIZE][SIZE];
-  __shared__ float Bs[SIZE][SIZE];
+  __shared__ float As[Bm][Bk];
+  __shared__ float Bs[Bk][Bn];
 
-  float temp[STRIDE][STRIDE] = {0.f}; // 每个线程在一个方向上处理STRIDE个元素
+  float temp[NUM_PER_THREAD] = {0.f};  // 每个线程在一个方向上处理STRIDE个元素
   // 对于矩阵A,offset是x方向的偏移量,对于矩阵B,offset是y方向的偏移量
-  for (int offset = 0; offset < K; offset += SIZE) {
-    for (int i = 0; i < STRIDE; ++i) {
-      for (int j = 0; j < STRIDE; ++j) {
-        As[ty * STRIDE + i][tx * STRIDE + j] = A_start
-            [(ty * STRIDE + i) * K + offset + tx * STRIDE +
-             j]; // A_start只是在y方向"start",在x方向仍然是从头开始算,所以要加偏移量,B_start同理
-        Bs[ty * STRIDE + i][tx * STRIDE + j] =
-            B_start[(ty * STRIDE + i + offset) * N + tx * STRIDE + j];
-      }
-    }
+  for (int offset = 0; offset < K; offset += Bk) {
+    // float4 读取A元素到shared mem
+    FETCH_FLOAT4(As[ty][tx * NUM_PER_THREAD]) =
+        FETCH_FLOAT4(A_start[K * ty + offset + tx * NUM_PER_THREAD]);
 
+    FETCH_FLOAT4(Bs[ty][tx * NUM_PER_THREAD]) =
+        FETCH_FLOAT4(B_start[N * (ty + offset) + tx * NUM_PER_THREAD]);
     __syncthreads();
-    for (int i = 0; i < STRIDE; ++i) {
-      for (int j = 0; j < STRIDE; ++j) {
-        for (int e = 0; e < SIZE; ++e) {
-          temp[i][j] += As[ty * STRIDE + i][e] * Bs[e][tx * STRIDE + j];
-        }
+
+    for (int i = 0; i < NUM_PER_THREAD; ++i) {
+      for (int kk = 0; kk < Bk; ++kk) {
+        temp[i] += As[ty][kk] * Bs[kk][tx * NUM_PER_THREAD + i];
       }
     }
     __syncthreads();
   }
 
-  float *C_start = C + N * blockIdx.y * SIZE + blockIdx.x * SIZE;
-  for (int i = 0; i < STRIDE; ++i) {
-    for (int j = 0; j < STRIDE; ++j) {
-      C_start[N * (ty * STRIDE + i) + tx * STRIDE + j] = temp[i][j];
-    }
-  }
+  float* C_start = C + N * blockIdx.y * Bm + blockIdx.x * Bn;
+  FETCH_FLOAT4(C_start[ty * N + tx * NUM_PER_THREAD]) = FETCH_FLOAT4(temp);
 }
 
 int main() {
-  constexpr int32_t m = 512; // 矩阵A的行
-  constexpr int32_t k = 256; // 矩阵A的列，也是矩阵B的行
-  constexpr int32_t n = 256; // 矩阵B的列
+  constexpr int32_t m = 512;  // 矩阵A的行
+  constexpr int32_t k = 256;  // 矩阵A的列，也是矩阵B的行
+  constexpr int32_t n = 256;  // 矩阵B的列
 
   const size_t mem_size_A = m * k * sizeof(float);
   const size_t mem_size_B = k * n * sizeof(float);
   const size_t mem_size_C = m * n * sizeof(float);
 
-  float *matrix_A_host = (float *)std::malloc(mem_size_A);
-  float *matrix_B_host = (float *)std::malloc(mem_size_B);
+  float* matrix_A_host = (float*)std::malloc(mem_size_A);
+  float* matrix_B_host = (float*)std::malloc(mem_size_B);
 
-  float *matrix_C_host_gpu_calc = (float *)std::malloc(mem_size_C);
-  float *matrix_C_host_cpu_calc = (float *)std::malloc(mem_size_C);
+  float* matrix_C_host_gpu_calc = (float*)std::malloc(mem_size_C);
+  float* matrix_C_host_cpu_calc = (float*)std::malloc(mem_size_C);
 
   // 初始化矩阵
   random_matrix(m, k, matrix_A_host);
@@ -121,13 +114,13 @@ int main() {
   memset(matrix_C_host_gpu_calc, 0, mem_size_C);
   memset(matrix_C_host_cpu_calc, 0, mem_size_C);
 
-  float *matrix_A_device;
-  float *matrix_B_device;
-  float *matrix_C_device;
+  float* matrix_A_device;
+  float* matrix_B_device;
+  float* matrix_C_device;
   // 分配设备内存
-  cudaMalloc((void **)&matrix_A_device, mem_size_A);
-  cudaMalloc((void **)&matrix_B_device, mem_size_B);
-  cudaMalloc((void **)&matrix_C_device, mem_size_C);
+  cudaMalloc((void**)&matrix_A_device, mem_size_A);
+  cudaMalloc((void**)&matrix_B_device, mem_size_B);
+  cudaMalloc((void**)&matrix_C_device, mem_size_C);
   // 将数据从CPU复制到GPU
   cudaMemcpy(matrix_A_device, matrix_A_host, mem_size_A,
              cudaMemcpyHostToDevice);
@@ -143,8 +136,8 @@ int main() {
   dim3 grid(n / Bn, m / Bm);
 
   cpu_sgemm(m, n, k, matrix_A_host, matrix_B_host, matrix_C_host_cpu_calc);
-  cuda_sgemm<<<grid, block>>>(matrix_A_device, matrix_B_device, matrix_C_device,
-                              m, n, k);
+  cuda_sgemm<Bm, Bn, Bk, 4><<<grid, block>>>(matrix_A_device, matrix_B_device,
+                                             matrix_C_device, m, n, k);
   cudaDeviceSynchronize();
   // 强制 CPU 等待 GPU 完成，并捕获 Kernel 运行时的异步错误
   // (例如非法的内存访问、寄存器溢出等)

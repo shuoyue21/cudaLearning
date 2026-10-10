@@ -8,6 +8,10 @@
 #include <cstdlib>
 #include <cstring>
 #include <random>
+#ifdef SGEMM_BENCHMARK
+#include "sgemm_benchmark_kernels.cuh"
+namespace sgemm_v5 {
+#endif
 
 __device__ __forceinline__ float4 load_float4(const float* ptr) {
   return *reinterpret_cast<const float4*>(ptr);
@@ -62,107 +66,72 @@ template <unsigned int Bm, unsigned int Bn, unsigned int Bk,
           >
 __global__ void cuda_sgemm(float* A, float* B, float* C, const int M,
                            const int N, const int K) {
-  // 整体思路是 在数据搬运阶段 采用float4 把搬运的条目和线程都一维化
-  // 在计算阶段 每个线程在各自计算自己的数据
-  // 采用搬运和计算分离的方式
-  constexpr int VEC_WIDTH = 4;  // 一个向量读取的宽度
-
-  // C tile 在两个方向分别需要多少个线程
-  constexpr int THREAD_M = Bm / Tm;
+  // 同一批物理线程有两种逻辑映射：
+  // 1. 使用 threadIdx.x/y 决定每个线程计算哪个 TM×TN 输出块
+  // 2. 使用一维 tid 给线程分配 float4 搬运任务
+  // 物理线程的 布局的关系
+  constexpr int VEC_WIDTH = 4;
+  constexpr int THREAD_M = Bm / Tm;  // C tile 需要多少行线程
   constexpr int THREAD_N = Bn / Tn;
-  constexpr int NUM_THREADS = THREAD_M * THREAD_N;
+  constexpr int NUM_THREADS = THREAD_M * THREAD_N;  // 总线程数
 
-  static_assert(Bm % Tm == 0, "BM must be divisible by TM");
-  static_assert(Bn % Tn == 0, "BN must be divisible by TN");
-  static_assert(Bk % VEC_WIDTH == 0, "BK must be divisible by 4");
-  static_assert(Bn % VEC_WIDTH == 0, "BN must be divisible by 4");
-  static_assert(NUM_THREADS <= 1024, "too many threads in one block");
-  /*
-   * 线程坐标直接对应计算布局：
-   *
-   * thread_m 决定该线程负责哪 TM 行
-   * thread_n 决定该线程负责哪 TN 列
-   */
-  // 计算布局线程坐标:
-  // 这里直接相等是因为物理线程布局和逻辑计算任务布局一致
-  // 一个Block负责32*32的tile 一个线程负责Tm*Tn 总共需要NUM_THREADS个线程
-  // 而启动时 dim3 block(THREAD_N, THREAD_M)
-  // 所以物理线程布局和逻辑计算任务布局一致
+  // 计算线程id 这里为什么一致呢?
   const int thread_m = threadIdx.y;
   const int thread_n = threadIdx.x;
-  // 线性线程号仅用于合作搬运数据
 
+  // 搬运线程tid
   const int tid = threadIdx.y * THREAD_N + threadIdx.x;
 
+  // 当前 block 对应的 C tile 左上角全局坐标。
   const int block_row = blockIdx.y * Bm;
   const int block_col = blockIdx.x * Bn;
-  /*
-   * A 在共享内存中转置存储。
-   *
-   * 原始逻辑：A_shared[BM][BK]
-   * 这里存为：A_shared[BK][BM]
-   *
-   * 计算时固定 k，线程访问不同的 M 位置，
-   * 转置后通常能减少 shared-memory bank conflict。
-   */
+
+  // A tile 在 shared memory 中转置存储。
+  // 计算时固定 kk，不同线程读取不同 m，
+  // 将 m 放在连续的第二维可以改善 shared-memory bank 访问。
   __shared__ float As[Bk][Bm];
   __shared__ float Bs[Bk][Bn];
 
+  // reg
   float a_reg[Tm] = {0.f};
   float b_reg[Tn] = {0.f};
-  float temp[Tm][Tn] = {0.f};
+  float accumulation[Tm][Tn] = {0.f};
+
   for (int offset = 0; offset < K; offset += Bk) {
-    /*
-     * 合作加载 A tile。
-     *
-     * A tile 一共有：
-     * BM * BK / 4 个 float4
-     *
-     * 不再要求“一个线程必须刚好加载一个 float4”。
-     * 如果加载任务比线程多，每个线程就多迭代几次。
-     */
+    // 先开始搬数据
 
-    // A原本的tile逻辑布局是 A_tile[m][k]
-    // 写入共享内存转置后变成了 As[k][m]
-    // 因此 As[kk][m_local] 对应 A[m_local+block_row][kk+offset]
-    // 所以 As[kk][m_local] = A[(m_local+block_row)*K+kk+offset]
-    constexpr int A_VEC_PER_ROW = Bk / VEC_WIDTH;    // 一行有几个float4
-    constexpr int A_VEC_COUNT = Bm * A_VEC_PER_ROW;  // 总共有多少个float4
+    // 从A向As搬运
+    // 采用搬运线程tid 以一维的视角来看待数据搬运
+    constexpr int A_VEC_PER_ROW = Bk / VEC_WIDTH;
+    constexpr int A_VEC_COUNT = A_VEC_PER_ROW * Bm;  // 总共有多少个搬运任务
     for (int vec_id = tid; vec_id < A_VEC_COUNT; vec_id += NUM_THREADS) {
-      // 当前tile的局部坐标
-      // tid 是线程编号 vec_id是当前线程领取的搬运任务编号
-      // 这里把任务编号转换为对应的二维坐标
-      // local_row local_col 就是要搬的对应的数据在原本的A tile对应的起始下标
-      const int local_row = vec_id / A_VEC_PER_ROW;
-      const int local_col = (vec_id % A_VEC_PER_ROW) * VEC_WIDTH;
-      // 先float4从global取数据
-      const float4 value =
-          load_float4(A + (block_row + local_row) * K + offset + local_col);
+      // 这里的vec_id 是搬运任务id
 
-      // 加载时顺便转置写入 shared memory
-      // local_row 和 local_col 是根据 Global Memory 中 A
-      // 的原始布局计算出来的，但 As 采用的是另一种布局。
-      // 这里的转置是为了方便后面计算阶段,沿着As的行方向读 是一种访存优化
+      // 将搬运任务id转换为A tile的坐标关系
+      const int local_row = vec_id / A_VEC_PER_ROW;
+      const int local_col =
+          (vec_id % A_VEC_PER_ROW) *
+          VEC_WIDTH;  // 因为一个线程搬运四个数据,所以要乘width
+      const float4 value =
+          load_float4(A + (local_row + block_row) * K + offset + local_col);
+      // 写入转置As
+      // As本来应该是[Bm][Bk] 所以是 As[local_row][local_col]
+      // 但是经过了转置
+      // 因为原本是按照行读取的float4,写入不转置的As也要按行,但是转置了
       As[local_col + 0][local_row] = value.x;
       As[local_col + 1][local_row] = value.y;
       As[local_col + 2][local_row] = value.z;
       As[local_col + 3][local_row] = value.w;
     }
 
-    /*
-     * 合作加载 B tile。
-     *
-     * B tile 一共有：
-     * BK * BN / 4 个 float4
-     */
-    constexpr int B_VEC_PER_ROW = Bn / VEC_WIDTH;    // 一行有几个float4
-    constexpr int B_VEC_COUNT = Bk * B_VEC_PER_ROW;  // 总共有多少个float4
+    constexpr int B_VEC_PER_ROW = Bn / VEC_WIDTH;
+    constexpr int B_VEC_COUNT = B_VEC_PER_ROW * Bk;
     for (int vec_id = tid; vec_id < B_VEC_COUNT; vec_id += NUM_THREADS) {
       const int local_row = vec_id / B_VEC_PER_ROW;
       const int local_col = (vec_id % B_VEC_PER_ROW) * VEC_WIDTH;
-      // 先float4从global取数据
+
       const float4 value =
-          load_float4(B + (offset + local_row) * N + block_col + local_col);
+          load_float4(B + (local_row + offset) * N + local_col + block_col);
 
       Bs[local_row][local_col + 0] = value.x;
       Bs[local_row][local_col + 1] = value.y;
@@ -172,50 +141,54 @@ __global__ void cuda_sgemm(float* A, float* B, float* C, const int M,
 
     __syncthreads();
 
-    /*
-     * 当前线程负责：
-     *
-     * 行：
-     * thread_m * TM ... thread_m * TM + TM - 1
-     *
-     * 列：
-     * thread_n * TN ... thread_n * TN + TN - 1
-     */
-    // 先搬数据
+// 开始计算每一个tile
 #pragma unroll
     for (int kk = 0; kk < Bk; ++kk) {
+// 先把数据从As搬运到reg
+// 这里的搬运要采用计算线程
 #pragma unroll
       for (int i = 0; i < Tm; ++i) {
+        // 如果 As 没有转置，应访问 As[m][kk]
+        // 当前 As 按 [kk][m] 转置存储，因此访问 As[kk][m]
         a_reg[i] = As[kk][thread_m * Tm + i];
       }
+
 #pragma unroll
-      for (int i = 0; i < Tn; ++i) {
-        b_reg[i] = Bs[kk][thread_n * Tn + i];
+      for (int j = 0; j < Tn; ++j) {
+        b_reg[j] = Bs[kk][thread_n * Tn + j];
       }
 
-      // TM × TN 外积
+      // 开始计算 外积
 #pragma unroll
       for (int i = 0; i < Tm; ++i) {
 #pragma unroll
         for (int j = 0; j < Tn; ++j) {
-          temp[i][j] += a_reg[i] * b_reg[j];
+          accumulation[i][j] += a_reg[i] * b_reg[j];
         }
       }
     }
 
-    // 所有线程读完当前 shared tile 后才能覆盖它
     __syncthreads();
   }
-  const int output_row = block_row + thread_m * Tm;
-  const int output_col = block_col + thread_n * Tn;
+  const int output_row = block_row + Tm * thread_m;
+  const int output_col = block_col + Tn * thread_n;
 
   for (int i = 0; i < Tm; ++i) {
     for (int j = 0; j < Tn; ++j) {
-      C[(output_row + i) * N + output_col + j] = temp[i][j];
+      C[(output_row + i) * N + output_col + j] = accumulation[i][j];
     }
   }
 }
 
+#ifdef SGEMM_BENCHMARK
+void launch(float* A, float* B, float* C, int M, int N, int K,
+            cudaStream_t stream) {
+  const dim3 block(8, 8);
+  const dim3 grid(N / 32, M / 32);
+  cuda_sgemm<32, 32, 32, 4, 4><<<grid, block, 0, stream>>>(A, B, C, M, N, K);
+}
+}  // namespace sgemm_v5
+#else
 int main() {
   constexpr int32_t m = 512;  // 矩阵A的行
   constexpr int32_t k = 256;  // 矩阵A的列，也是矩阵B的行
@@ -308,3 +281,4 @@ int main() {
 
   return 0;
 }
+#endif  // SGEMM_BENCHMARK

@@ -7,6 +7,12 @@ set(CMAKE_CXX_STANDARD_REQUIRED ON)
 set(CMAKE_CUDA_STANDARD 20)
 set(CMAKE_CUDA_STANDARD_REQUIRED ON)
 
+# 已有构建目录可能缓存了空的 Release flags，补齐优化选项。
+if(CMAKE_CUDA_FLAGS_RELEASE STREQUAL "")
+  set(CMAKE_CUDA_FLAGS_RELEASE "-O3 -DNDEBUG" CACHE STRING
+      "Flags used by the CUDA compiler during RELEASE builds." FORCE)
+endif()
+
 if(CMAKE_BUILD_TYPE STREQUAL "Debug")
   string(APPEND CMAKE_CUDA_FLAGS_DEBUG " -g -G -O0")
   string(APPEND CMAKE_CXX_FLAGS_DEBUG " -g -O0")
@@ -46,7 +52,24 @@ add_executable(sgemm_v5  sgemm_v5.cu)
 # 链接 CUDA 运行时
 target_link_libraries(sgemm_v5  PRIVATE CUDA::cudart)
 
-add_executable(sgemm_double_buffer  sgemm_double_buffer.cu)
+add_executable(sgemm_v6  sgemm_v6.cu)
 
 # 链接 CUDA 运行时
-target_link_libraries(sgemm_double_buffer  PRIVATE CUDA::cudart)
+target_link_libraries(sgemm_v6  PRIVATE CUDA::cudart)
+
+# 将原版本编译为独立 namespace 下的 launcher，保留各自的学习用 main。
+add_executable(sgemm_benchmark
+  sgemm_benchmark.cu
+  sgemm_v1.cu
+  sgemm_v2.cu
+  sgemm_v3.cu
+  sgemm_v4.cu
+  sgemm_v5.cu
+  sgemm_v6.cu
+)
+target_compile_definitions(sgemm_benchmark PRIVATE SGEMM_BENCHMARK)
+target_link_libraries(sgemm_benchmark PRIVATE CUDA::cudart CUDA::cublas)
+
+if(CMAKE_BUILD_TYPE STREQUAL "Debug")
+  message(WARNING "sgemm_benchmark should be built in Release mode for timing")
+endif()

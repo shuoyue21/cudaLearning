@@ -8,6 +8,10 @@
 #include <cstdlib>
 #include <cstring>
 #include <random>
+#ifdef SGEMM_BENCHMARK
+#include "sgemm_benchmark_kernels.cuh"
+namespace sgemm_v4 {
+#endif
 #define FETCH_FLOAT4(x) (*reinterpret_cast<float4*>(&(x)))
 void random_matrix(int m, int n, float* matrix) {
   // 1. 实例化硬件随机设备，用于生成非确定性种子
@@ -92,6 +96,15 @@ __global__ void cuda_sgemm(float* A, float* B, float* C, const int M,
   FETCH_FLOAT4(C_start[ty * N + tx * NUM_PER_THREAD]) = FETCH_FLOAT4(temp);
 }
 
+#ifdef SGEMM_BENCHMARK
+void launch(float* A, float* B, float* C, int M, int N, int K,
+            cudaStream_t stream) {
+  const dim3 block(8, 32);
+  const dim3 grid(N / 32, M / 32);
+  cuda_sgemm<32, 32, 32, 4><<<grid, block, 0, stream>>>(A, B, C, M, N, K);
+}
+}  // namespace sgemm_v4
+#else
 int main() {
   constexpr int32_t m = 512;  // 矩阵A的行
   constexpr int32_t k = 256;  // 矩阵A的列，也是矩阵B的行
@@ -173,3 +186,4 @@ int main() {
 
   return 0;
 }
+#endif  // SGEMM_BENCHMARK

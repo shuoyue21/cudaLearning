@@ -228,7 +228,7 @@ __global__ void cuda_sgemm_double_buffer(const float* __restrict__ A,
      * tile 2 使用 stage 0
      * tile 3 使用 stage 1
      */
-    const int read_stage = tile_id & 1;
+    const int read_stage = tile_id & 1;  // 等价于%2
 
     /*
      * 等待 pipeline 中最早提交的 tile 完成。

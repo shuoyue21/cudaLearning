@@ -125,6 +125,8 @@ const std::vector<Kernel> kKernels = {
      sgemm_v5::launch},
     {"v6", "32x32 tile, async copies, two stages, 4x4 outputs/thread", 32,
      sgemm_v6::launch},
+    {"v7", "32x32 block, 16x32 warp, 4x4 thread, BK=32, boundary checks", 1,
+     sgemm_v7::launch},
     {"warp32", "32x32 block, 16x32 warp, 4x4 thread, BK=32, boundary checks",
      1, sgemm_warp_tiling::launch32},
     {"warp64", "64x64 block, 16x32 warp, 4x4 thread, BK=16, boundary checks",

@@ -57,6 +57,11 @@ add_executable(sgemm_v6  sgemm_v6.cu)
 # 链接 CUDA 运行时
 target_link_libraries(sgemm_v6  PRIVATE CUDA::cudart)
 
+add_executable(sgemm_v7  sgemm_v7.cu)
+
+# 链接 CUDA 运行时
+target_link_libraries(sgemm_v7  PRIVATE CUDA::cudart)
+
 # 将原版本编译为独立 namespace 下的 launcher，保留各自的学习用 main。
 add_executable(sgemm_benchmark
   sgemm_benchmark.cu
@@ -66,6 +71,7 @@ add_executable(sgemm_benchmark
   sgemm_v4.cu
   sgemm_v5.cu
   sgemm_v6.cu
+  sgemm_v7.cu
   sgemm_warp_tiling_benchmark.cu
 )
 target_compile_definitions(sgemm_benchmark PRIVATE SGEMM_BENCHMARK)

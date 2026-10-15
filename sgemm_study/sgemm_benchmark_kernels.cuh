@@ -27,6 +27,10 @@ namespace sgemm_v6 {
 void launch(float* A, float* B, float* C, int M, int N, int K,
             cudaStream_t stream);
 }
+namespace sgemm_v7 {
+void launch(float* A, float* B, float* C, int M, int N, int K,
+            cudaStream_t stream);
+}
 
 namespace sgemm_warp_tiling {
 void launch32(float* A, float* B, float* C, int M, int N, int K,
